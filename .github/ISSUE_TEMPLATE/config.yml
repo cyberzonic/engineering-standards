@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: CyberZonic Security
+    url: mailto:security@cyberzonic.com
+    about: Report vulnerabilities or sensitive security concerns privately.
+  - name: CyberZonic Support
+    url: mailto:support@cyberzonic.com
+    about: Product or platform support enquiries.
