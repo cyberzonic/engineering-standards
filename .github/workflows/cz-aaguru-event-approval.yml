@@ -1,0 +1,150 @@
+name: CyberZonic AAGURU Event Approval
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - review_requested
+      - synchronize
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: cz-aaguru-event-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  approve:
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.user.login == 'cyberzonic-engineering'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Validate live request and approve exact head
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CZ_AAGURU_APPROVAL_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::CZ_AAGURU_APPROVAL_TOKEN is not configured."
+            exit 1
+          fi
+
+          viewer="$(gh api user --jq '.login')"
+
+          if [[ "$viewer" != "aaguru" ]]; then
+            echo "::error::Approval token identity is '$viewer'; expected 'aaguru'."
+            exit 1
+          fi
+
+          pr_json="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")"
+
+          state="$(jq -r '.state' <<<"$pr_json")"
+          draft="$(jq -r '.draft' <<<"$pr_json")"
+          author="$(jq -r '.user.login' <<<"$pr_json")"
+          head_sha="$(jq -r '.head.sha' <<<"$pr_json")"
+          head_owner="$(jq -r '.head.repo.owner.login // ""' <<<"$pr_json")"
+
+          if [[ "$state" != "open" ]]; then
+            echo "PR is not open; skipping."
+            exit 0
+          fi
+
+          if [[ "$draft" == "true" ]]; then
+            echo "PR is draft; skipping."
+            exit 0
+          fi
+
+          if [[ "$author" != "cyberzonic-engineering" ]]; then
+            echo "Author '$author' is not on the CyberZonic auto-approval allowlist; skipping."
+            exit 0
+          fi
+
+          if [[ "$head_owner" != "cyberzonic" ]]; then
+            echo "Head repository owner '$head_owner' is not cyberzonic; skipping."
+            exit 0
+          fi
+
+          individual_requested="$(
+            jq -r '[.requested_reviewers[]?.login] | index("aaguru") != null' <<<"$pr_json"
+          )"
+
+          team_requested="$(
+            jq -r '[.requested_teams[]?.slug] | index("cyberzonic-owners") != null' <<<"$pr_json"
+          )"
+
+          team_authorised="false"
+
+          if [[ "$team_requested" == "true" ]]; then
+            membership="$(
+              gh api "orgs/cyberzonic/teams/cyberzonic-owners/memberships/aaguru" \
+                --jq '.state' 2>/dev/null || true
+            )"
+
+            if [[ "$membership" == "active" ]]; then
+              team_authorised="true"
+            fi
+          fi
+
+          if [[ "$individual_requested" != "true" && "$team_authorised" != "true" ]]; then
+            echo "No live aaguru/cyberzonic-owners review request; skipping."
+            exit 0
+          fi
+
+          reviews_json="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100")"
+
+          if jq -e --arg head "$head_sha" '
+              .[] |
+              select(
+                .user.login == "aaguru" and
+                .state == "APPROVED" and
+                .commit_id == $head
+              )
+            ' <<<"$reviews_json" >/dev/null; then
+            echo "Exact current head $head_sha already approved by aaguru; skipping duplicate."
+            exit 0
+          fi
+
+          echo "Approving ${REPO}#${PR_NUMBER} at exact head ${head_sha}"
+
+          gh api \
+            --method POST \
+            "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+            -f event=APPROVE \
+            -f commit_id="$head_sha" \
+            >/dev/null
+
+          after_json="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")"
+          after_head="$(jq -r '.head.sha' <<<"$after_json")"
+
+          if [[ "$after_head" != "$head_sha" ]]; then
+            echo "PR head moved from $head_sha to $after_head during approval."
+            echo "The synchronize event for the new head will re-evaluate it."
+            exit 0
+          fi
+
+          after_reviews="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100")"
+
+          if ! jq -e --arg head "$head_sha" '
+              .[] |
+              select(
+                .user.login == "aaguru" and
+                .state == "APPROVED" and
+                .commit_id == $head
+              )
+            ' <<<"$after_reviews" >/dev/null; then
+            echo "::error::Exact-head approval could not be verified."
+            exit 1
+          fi
+
+          echo "APPROVED_VERIFIED: ${REPO}#${PR_NUMBER} @ ${head_sha}"
